@@ -15,6 +15,9 @@ build/
 dist/
 *.spec~
 
+media/photos/
+media/videos/
+
 *.log
 *.tmp
 

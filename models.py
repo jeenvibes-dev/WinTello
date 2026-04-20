@@ -35,6 +35,8 @@ class TelemetryData:
     battery: Optional[int] = None
     height: Optional[int] = None
     temperature: Optional[int] = None
+    temperature_low: Optional[int] = None
+    temperature_high: Optional[int] = None
     flight_time: Optional[int] = None
     speed: Optional[float] = None
     airborne: bool = False

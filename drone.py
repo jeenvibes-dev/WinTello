@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -13,6 +14,76 @@ from models import TelemetryData
 LOGGER = logging.getLogger(__name__)
 
 
+class LowLatencyVideoReader:
+    """Continuously drains the Tello UDP stream and keeps only the newest frame."""
+
+    def __init__(self, address: str) -> None:
+        self._address = address
+        self._frame = None
+        self._failed = False
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._capture = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._read_loop, name="tello-video", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self._capture is not None:
+            self._capture.release()
+            self._capture = None
+
+    def get_frame(self):
+        with self._frame_lock:
+            return self._frame
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def _read_loop(self) -> None:
+        try:
+            capture = self._open_capture()
+        except Exception as exc:
+            self._failed = True
+            LOGGER.warning("Unable to open low-latency video stream: %s", exc)
+            return
+
+        self._capture = capture
+        while not self._stop_event.is_set():
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                time.sleep(0.01)
+                continue
+            rgb_frame = frame[:, :, [2, 1, 0]]
+            with self._frame_lock:
+                self._frame = rgb_frame
+
+    def _open_capture(self):
+        # These FFmpeg flags tell OpenCV to favor live playback over buffered playback.
+        os.environ.setdefault(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "fflags;nobuffer|flags;low_delay|probesize;32|analyzeduration;0",
+        )
+        import cv2
+
+        api_preference = getattr(cv2, "CAP_FFMPEG", 0)
+        capture = cv2.VideoCapture(self._address, api_preference)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not capture.isOpened():
+            capture.release()
+            raise RuntimeError("video stream did not open")
+        return capture
+
+
 class TelloBackend:
     """Small adapter around djitellopy so the Drone wrapper stays testable."""
 
@@ -20,12 +91,38 @@ class TelloBackend:
         from djitellopy import Tello
 
         self._tello = Tello()
+        self._frame_read = None
+        self._video_reader: Optional[LowLatencyVideoReader] = None
 
     def connect(self) -> None:
         self._tello.connect()
 
     def end(self) -> None:
         self._tello.end()
+
+    def streamon(self) -> None:
+        self._tello.streamon()
+        address = self._tello.get_udp_video_address()
+        self._video_reader = LowLatencyVideoReader(address)
+        self._video_reader.start()
+
+    def streamoff(self) -> None:
+        if self._video_reader is not None:
+            self._video_reader.stop()
+            self._video_reader = None
+        self._tello.streamoff()
+        self._frame_read = None
+
+    def get_video_frame(self):
+        if self._video_reader is not None:
+            frame = self._video_reader.get_frame()
+            if frame is not None:
+                return frame
+            if not self._video_reader.failed:
+                return None
+        if self._frame_read is None:
+            self._frame_read = self._tello.get_frame_read(with_queue=True, max_queue_len=1)
+        return self._frame_read.frame
 
     def send_rc_control(self, left_right: int, forward_back: int, up_down: int, yaw: int) -> None:
         self._tello.send_rc_control(left_right, forward_back, up_down, yaw)
@@ -60,6 +157,12 @@ class TelloBackend:
     def get_temperature(self) -> int:
         return int(self._tello.get_temperature())
 
+    def get_lowest_temperature(self) -> int:
+        return int(self._tello.get_lowest_temperature())
+
+    def get_highest_temperature(self) -> int:
+        return int(self._tello.get_highest_temperature())
+
     def get_flight_time(self) -> int:
         return int(self._tello.get_flight_time())
 
@@ -85,6 +188,7 @@ class Drone:
         self._stop_event = threading.Event()
         self._telemetry_thread: Optional[threading.Thread] = None
         self._emergency_until = 0.0
+        self._video_enabled = False
 
     @property
     def is_connected(self) -> bool:
@@ -119,6 +223,7 @@ class Drone:
             self._telemetry.retry_exhausted = False
             self._telemetry.retries = 0
             self._telemetry.last_error = None
+        self._start_video_stream()
         self.refresh_telemetry()
         self._ensure_telemetry_thread()
         return True
@@ -149,6 +254,7 @@ class Drone:
         self._connected = False
         self._airborne = False
         if self._backend is not None:
+            self._stop_video_stream()
             try:
                 self._backend.end()
             except Exception as exc:
@@ -246,13 +352,24 @@ class Drone:
                 self._telemetry.emergency_active = False
         return telemetry
 
+    def get_video_frame(self):
+        if not self._connected or self._backend is None or not self._video_enabled:
+            return None
+        if not hasattr(self._backend, "get_video_frame"):
+            return None
+        try:
+            return self._backend.get_video_frame()
+        except Exception as exc:
+            LOGGER.warning("video frame read failed: %s", exc)
+            return None
+
     def refresh_telemetry(self) -> bool:
         if not self._connected or self._backend is None:
             return False
         try:
             battery = self._backend.get_battery()
             height = self._backend.get_height()
-            temperature = self._backend.get_temperature()
+            temperature, temperature_low, temperature_high = self._read_temperature()
             flight_time = self._backend.get_flight_time()
         except Exception as exc:
             LOGGER.warning("telemetry refresh failed: %s", exc)
@@ -264,6 +381,8 @@ class Drone:
             self._telemetry.battery = battery
             self._telemetry.height = height
             self._telemetry.temperature = temperature
+            self._telemetry.temperature_low = temperature_low
+            self._telemetry.temperature_high = temperature_high
             self._telemetry.flight_time = flight_time
             self._telemetry.airborne = self._airborne
             self._telemetry.signal_strength = "strong"
@@ -272,6 +391,15 @@ class Drone:
             self._telemetry.retries = self._retry_count
             self._telemetry.last_error = None
         return True
+
+    def _read_temperature(self) -> tuple[int, Optional[int], Optional[int]]:
+        assert self._backend is not None
+        if hasattr(self._backend, "get_lowest_temperature") and hasattr(self._backend, "get_highest_temperature"):
+            low = int(self._backend.get_lowest_temperature())
+            high = int(self._backend.get_highest_temperature())
+            return round((low + high) / 2), low, high
+        temperature = int(self._backend.get_temperature())
+        return temperature, None, None
 
     def _ensure_backend(self) -> Optional[object]:
         if self._backend is not None:
@@ -294,6 +422,27 @@ class Drone:
         )
         self._telemetry_thread.start()
 
+    def _start_video_stream(self) -> None:
+        if self._backend is None or not hasattr(self._backend, "streamon"):
+            return
+        try:
+            self._backend.streamon()
+            self._video_enabled = True
+        except Exception as exc:
+            self._video_enabled = False
+            LOGGER.warning("Tello video stream failed to start: %s", exc)
+
+    def _stop_video_stream(self) -> None:
+        if self._backend is None or not self._video_enabled or not hasattr(self._backend, "streamoff"):
+            self._video_enabled = False
+            return
+        try:
+            self._backend.streamoff()
+        except Exception as exc:
+            LOGGER.warning("Tello video stream failed to stop: %s", exc)
+        finally:
+            self._video_enabled = False
+
     def _telemetry_loop(self) -> None:
         while not self._stop_event.wait(self._telemetry_poll_interval):
             if self._connected:
@@ -310,6 +459,7 @@ class Drone:
         )
 
     def _set_disconnected_state(self, message: str, retrying: bool = False) -> None:
+        self._stop_video_stream()
         self._connected = False
         self._airborne = False
         with self._telemetry_lock:
