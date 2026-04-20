@@ -24,6 +24,8 @@ class FakeBackend:
     battery: int = 80
     height: int = 0
     temperature: int = 65
+    temperature_low: int = None
+    temperature_high: int = None
     flight_time: int = 0
     connected: bool = False
     end_called: bool = False
@@ -31,6 +33,9 @@ class FakeBackend:
     land_called: int = 0
     emergency_called: int = 0
     flip_called: int = 0
+    streamon_called: int = 0
+    streamoff_called: int = 0
+    video_frame: object = "frame"
     sent_rc: list = None
 
     def __post_init__(self) -> None:
@@ -46,6 +51,12 @@ class FakeBackend:
     def end(self) -> None:
         self.end_called = True
         self.connected = False
+
+    def streamon(self) -> None:
+        self.streamon_called += 1
+
+    def streamoff(self) -> None:
+        self.streamoff_called += 1
 
     def send_rc_control(self, left_right: int, forward_back: int, up_down: int, yaw: int) -> None:
         if not self.connected:
@@ -88,14 +99,27 @@ class FakeBackend:
             raise RuntimeError("telemetry failed")
         return self.temperature
 
+    def get_lowest_temperature(self) -> int:
+        if self.telemetry_failure:
+            raise RuntimeError("telemetry failed")
+        return self.temperature if self.temperature_low is None else self.temperature_low
+
+    def get_highest_temperature(self) -> int:
+        if self.telemetry_failure:
+            raise RuntimeError("telemetry failed")
+        return self.temperature if self.temperature_high is None else self.temperature_high
+
     def get_flight_time(self) -> int:
         if self.telemetry_failure:
             raise RuntimeError("telemetry failed")
         return self.flight_time
 
+    def get_video_frame(self):
+        return self.video_frame
+
 
 def test_connect_success_refreshes_telemetry():
-    backend = FakeBackend(battery=77, height=42, temperature=61, flight_time=9)
+    backend = FakeBackend(battery=77, height=42, temperature_low=60, temperature_high=62, flight_time=9)
     drone = Drone(backend=backend)
 
     assert drone.connect() is True
@@ -105,7 +129,23 @@ def test_connect_success_refreshes_telemetry():
     assert telemetry.battery == 77
     assert telemetry.height == 42
     assert telemetry.temperature == 61
+    assert telemetry.temperature_low == 60
+    assert telemetry.temperature_high == 62
     assert telemetry.flight_time == 9
+    assert backend.streamon_called == 1
+
+
+def test_video_frame_available_after_connect_and_stops_on_disconnect():
+    backend = FakeBackend(video_frame="latest")
+    drone = Drone(backend=backend)
+
+    assert drone.get_video_frame() is None
+    assert drone.connect() is True
+    assert drone.get_video_frame() == "latest"
+
+    drone.disconnect()
+    assert drone.get_video_frame() is None
+    assert backend.streamoff_called == 1
 
 
 def test_connect_failure_sets_retrying_state():

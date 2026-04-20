@@ -11,6 +11,7 @@ import pygame
 import config
 from controller import Controller
 from drone import Drone
+from media import MediaManager
 from models import ControllerState, TelemetryData
 from ui import UI
 from utils import load_sound
@@ -31,6 +32,9 @@ class UIState:
     connection_label: str
     takeoff_prompt: Optional[str]
     busy_text: Optional[str]
+    capture_mode: str
+    recording: bool
+    media_text: Optional[str]
 
 
 @dataclass
@@ -41,6 +45,7 @@ class Runtime:
     drone: Drone
     ui: UI
     sounds: Dict[str, object]
+    media: MediaManager
     button_flash_until: Dict[str, float]
     low_battery_sound_at: float
     last_connection_state: Optional[bool]
@@ -49,6 +54,9 @@ class Runtime:
     action_threads: Dict[str, threading.Thread]
     action_lock: threading.Lock
     busy_action: Optional[str]
+    capture_mode: str
+    media_message: Optional[str]
+    media_message_until: float
 
 
 def init_pygame(headless: bool = False) -> None:
@@ -64,7 +72,7 @@ def init_pygame(headless: bool = False) -> None:
 def create_runtime(headless: bool = False, auto_connect: bool = True) -> Runtime:
     init_pygame(headless=headless)
     pygame.display.set_caption(config.WINDOW_TITLE)
-    screen = pygame.display.set_mode((config.WINDOW_WIDTH, config.WINDOW_HEIGHT))
+    screen = pygame.display.set_mode(calculate_initial_window_size(), pygame.RESIZABLE)
     clock = pygame.time.Clock()
     drone = Drone()
     if auto_connect:
@@ -76,6 +84,7 @@ def create_runtime(headless: bool = False, auto_connect: bool = True) -> Runtime
         drone=drone,
         ui=UI(),
         sounds=load_sounds(pygame),
+        media=MediaManager(),
         button_flash_until={},
         low_battery_sound_at=0.0,
         last_connection_state=None,
@@ -84,7 +93,25 @@ def create_runtime(headless: bool = False, auto_connect: bool = True) -> Runtime
         action_threads={},
         action_lock=threading.Lock(),
         busy_action=None,
+        capture_mode="photo",
+        media_message=None,
+        media_message_until=0.0,
     )
+
+
+def calculate_initial_window_size(display_info=None) -> tuple[int, int]:
+    if display_info is None:
+        display_info = pygame.display.Info()
+    display_width = getattr(display_info, "current_w", 0) or config.WINDOW_WIDTH
+    display_height = getattr(display_info, "current_h", 0) or config.WINDOW_HEIGHT
+    available_width = max(640, int(display_width * config.WINDOW_SCREEN_WIDTH_RATIO))
+    available_height = max(480, int(display_height * config.WINDOW_SCREEN_HEIGHT_RATIO))
+
+    width = min(config.WINDOW_WIDTH, available_width)
+    height = min(config.WINDOW_HEIGHT, available_height)
+    width = max(min(config.MIN_WINDOW_WIDTH, available_width), width)
+    height = max(min(config.MIN_WINDOW_HEIGHT, available_height), height)
+    return width, height
 
 
 def shutdown(runtime: Runtime) -> None:
@@ -92,6 +119,7 @@ def shutdown(runtime: Runtime) -> None:
         active_threads = list(runtime.action_threads.values())
     for thread in active_threads:
         thread.join(timeout=1.0)
+    runtime.media.stop_recording()
     if runtime.drone.is_airborne:
         runtime.drone.land()
     runtime.drone.disconnect()
@@ -109,15 +137,28 @@ def run_app(frame_limit: Optional[int] = None, headless: bool = False, auto_conn
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         running = False
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        if runtime.ui.playback_button_hit(runtime.screen, event.pos):
+                            open_playback(runtime)
+                    elif event.type == pygame.VIDEORESIZE:
+                        runtime.screen = pygame.display.set_mode(
+                            (
+                                max(config.MIN_WINDOW_WIDTH, event.w),
+                                max(config.MIN_WINDOW_HEIGHT, event.h),
+                            ),
+                            pygame.RESIZABLE,
+                        )
             except pygame.error as exc:
                 LOGGER.warning("Pygame event handling failed: %s", exc)
 
             controller_state = runtime.controller.update()
-            handle_controller_actions(runtime, controller_state)
             telemetry = runtime.drone.get_telemetry()
+            video_frame = runtime.drone.get_video_frame()
+            handle_controller_actions(runtime, controller_state, video_frame)
+            runtime.media.write_video_frame(video_frame)
             ui_state = build_ui_state(runtime, controller_state, telemetry)
             maybe_play_sounds(runtime, telemetry)
-            runtime.ui.draw(runtime.screen, controller_state, telemetry, ui_state)
+            runtime.ui.draw(runtime.screen, controller_state, telemetry, ui_state, video_frame)
             pygame.display.flip()
             runtime.clock.tick(config.FPS)
 
@@ -140,7 +181,7 @@ def load_sounds(pygame_module) -> Dict[str, object]:
     }
 
 
-def handle_controller_actions(runtime: Runtime, controller_state: ControllerState) -> None:
+def handle_controller_actions(runtime: Runtime, controller_state: ControllerState, video_frame=None) -> None:
     now = time.monotonic()
     flash_map = {
         "r2_y": controller_state.takeoff_land_pressed,
@@ -148,6 +189,8 @@ def handle_controller_actions(runtime: Runtime, controller_state: ControllerStat
         "l2_down": controller_state.flip_direction == "back",
         "l2_left": controller_state.flip_direction == "left",
         "l2_right": controller_state.flip_direction == "right",
+        "l1": controller_state.lb_pressed,
+        "r1": controller_state.rb_pressed,
     }
     for name, active in flash_map.items():
         if active:
@@ -161,6 +204,10 @@ def handle_controller_actions(runtime: Runtime, controller_state: ControllerStat
     if controller_state.flip_direction:
         direction = controller_state.flip_direction
         start_action(runtime, "flip", lambda: runtime.drone.flip(direction), None)
+    if controller_state.lb_pressed:
+        toggle_capture_mode(runtime)
+    if controller_state.rb_pressed:
+        handle_media_capture(runtime, video_frame)
 
     if controller_state.connected:
         runtime.drone.send_rc(
@@ -171,6 +218,56 @@ def handle_controller_actions(runtime: Runtime, controller_state: ControllerStat
         )
     else:
         runtime.drone.send_rc(0, 0, 0, 0)
+
+
+def toggle_capture_mode(runtime: Runtime) -> None:
+    if runtime.media.is_recording:
+        set_media_message(runtime, "Stop recording before switching mode")
+        return
+    runtime.capture_mode = "video" if runtime.capture_mode == "photo" else "photo"
+    set_media_message(runtime, f"{runtime.capture_mode.upper()} MODE")
+
+
+def handle_media_capture(runtime: Runtime, video_frame) -> None:
+    try:
+        if runtime.capture_mode == "photo":
+            path = runtime.media.capture_photo(video_frame)
+            if path is None:
+                set_media_message(runtime, "No camera frame for photo")
+            else:
+                set_media_message(runtime, f"Photo saved: {path.name}")
+            return
+
+        if runtime.media.is_recording:
+            path = runtime.media.stop_recording()
+            if path is None:
+                set_media_message(runtime, "Recording stopped")
+            else:
+                set_media_message(runtime, f"Video saved: {path.name}")
+            return
+
+        path = runtime.media.start_recording(video_frame)
+        if path is None:
+            set_media_message(runtime, "No camera frame for video")
+        else:
+            set_media_message(runtime, "Recording video")
+    except Exception as exc:
+        LOGGER.warning("Media capture failed: %s", exc)
+        set_media_message(runtime, "Media save failed")
+
+
+def open_playback(runtime: Runtime) -> None:
+    try:
+        runtime.media.open_playback()
+        set_media_message(runtime, "Opened playback folder")
+    except Exception as exc:
+        LOGGER.warning("Playback open failed: %s", exc)
+        set_media_message(runtime, "Could not open playback")
+
+
+def set_media_message(runtime: Runtime, message: str) -> None:
+    runtime.media_message = message
+    runtime.media_message_until = time.monotonic() + 3.0
 
 
 def build_ui_state(runtime: Runtime, controller_state: ControllerState, telemetry: TelemetryData) -> UIState:
@@ -192,6 +289,8 @@ def build_ui_state(runtime: Runtime, controller_state: ControllerState, telemetr
         takeoff_prompt = "Use D-pad while holding L2 to flip"
 
     connection_label = "CONNECTED" if telemetry.connected else "DISCONNECTED"
+    if runtime.media_message and time.monotonic() >= runtime.media_message_until:
+        runtime.media_message = None
     return UIState(
         alert_text=alert_text,
         alert_level=alert_level,
@@ -199,6 +298,9 @@ def build_ui_state(runtime: Runtime, controller_state: ControllerState, telemetr
         connection_label=connection_label,
         takeoff_prompt=takeoff_prompt,
         busy_text=runtime.busy_action,
+        capture_mode=runtime.capture_mode,
+        recording=runtime.media.is_recording,
+        media_text=runtime.media_message,
     )
 
 

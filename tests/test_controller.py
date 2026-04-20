@@ -208,3 +208,19 @@ def test_l2_suppresses_backward_motion_bleed():
     assert state.l2_pressed is True
     assert state.right_y == 0
     assert state.controller_name == "Fake Controller"
+
+
+def test_lb_and_rb_buttons_fire_on_press_edges():
+    clock = FakeClock()
+    joystick = FakeJoystick(buttons={4: True, 5: True})
+    joystick_module = FakeJoystickModule()
+    joystick_module.devices = [joystick]
+    controller = Controller(pygame_module=FakePygame(joystick_module), time_fn=clock)
+
+    first_state = controller.update()
+    second_state = controller.update()
+
+    assert first_state.lb_pressed is True
+    assert first_state.rb_pressed is True
+    assert second_state.lb_pressed is False
+    assert second_state.rb_pressed is False

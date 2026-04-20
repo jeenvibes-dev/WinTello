@@ -50,6 +50,43 @@ class FakeDrone:
         self.disconnect_called = getattr(self, "disconnect_called", 0) + 1
 
 
+class FakeMedia:
+    def __init__(self) -> None:
+        self.photo_calls = 0
+        self.started = 0
+        self.stopped = 0
+        self.frames = 0
+        self.opened = 0
+        self._recording = False
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def capture_photo(self, frame):
+        self.photo_calls += 1
+        return None if frame is None else __import__("pathlib").Path("photo.jpg")
+
+    def start_recording(self, frame):
+        if frame is None:
+            return None
+        self.started += 1
+        self._recording = True
+        return __import__("pathlib").Path("video.avi")
+
+    def write_video_frame(self, frame) -> None:
+        if self._recording and frame is not None:
+            self.frames += 1
+
+    def stop_recording(self):
+        self.stopped += 1
+        self._recording = False
+        return __import__("pathlib").Path("video.avi")
+
+    def open_playback(self) -> None:
+        self.opened += 1
+
+
 def make_runtime() -> main.Runtime:
     return main.Runtime(
         screen=None,
@@ -64,6 +101,7 @@ def make_runtime() -> main.Runtime:
             "low_battery": FakeSound(),
             "error": FakeSound(),
         },
+        media=FakeMedia(),
         button_flash_until={},
         low_battery_sound_at=0.0,
         last_connection_state=None,
@@ -72,6 +110,9 @@ def make_runtime() -> main.Runtime:
         action_threads={},
         action_lock=__import__("threading").Lock(),
         busy_action=None,
+        capture_mode="photo",
+        media_message=None,
+        media_message_until=0.0,
     )
 
 
@@ -153,6 +194,8 @@ def test_build_ui_state_exposes_takeoff_prompt_and_button_highlight():
     assert ui_state.highlighted_buttons["r2_y"] is True
     assert ui_state.connection_label == "CONNECTED"
     assert ui_state.busy_text is None
+    assert ui_state.capture_mode == "photo"
+    assert ui_state.recording is False
 
 
 def test_takeoff_land_combo_lands_when_drone_is_airborne():
@@ -204,3 +247,30 @@ def test_shutdown_lands_before_disconnect_when_airborne():
 
     assert runtime.drone.land_called == 1
     assert runtime.drone.disconnect_called == 1
+
+
+def test_l1_toggles_capture_mode_and_r1_captures_photo():
+    runtime = make_runtime()
+
+    main.handle_controller_actions(runtime, ControllerState(connected=True, lb_pressed=True), "frame")
+    assert runtime.capture_mode == "video"
+
+    main.handle_controller_actions(runtime, ControllerState(connected=True, lb_pressed=True), "frame")
+    assert runtime.capture_mode == "photo"
+
+    main.handle_controller_actions(runtime, ControllerState(connected=True, rb_pressed=True), "frame")
+    assert runtime.media.photo_calls == 1
+    assert "Photo saved" in runtime.media_message
+
+
+def test_r1_toggles_video_recording_in_video_mode():
+    runtime = make_runtime()
+    runtime.capture_mode = "video"
+
+    main.handle_controller_actions(runtime, ControllerState(connected=True, rb_pressed=True), "frame")
+    assert runtime.media.is_recording is True
+    assert runtime.media.started == 1
+
+    main.handle_controller_actions(runtime, ControllerState(connected=True, rb_pressed=True), "frame")
+    assert runtime.media.is_recording is False
+    assert runtime.media.stopped == 1

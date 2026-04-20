@@ -3,8 +3,12 @@ from models import ControllerState, TelemetryData
 
 
 def test_window_defaults_are_defined():
-    assert config.WINDOW_WIDTH == 1180
-    assert config.WINDOW_HEIGHT == 760
+    assert config.WINDOW_WIDTH == 1600
+    assert config.WINDOW_HEIGHT == 900
+    assert config.MIN_WINDOW_WIDTH == 960
+    assert config.MIN_WINDOW_HEIGHT == 620
+    assert config.WINDOW_SCREEN_WIDTH_RATIO == 0.92
+    assert config.WINDOW_SCREEN_HEIGHT_RATIO == 0.86
     assert config.FPS == 60
 
 
